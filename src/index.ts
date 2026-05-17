@@ -18,6 +18,14 @@ const __dirname = path.dirname(__filename);
 const CONTEXT_DIR =
   process.env.CONTEXT_DIR ?? path.join(__dirname, "../context");
 
+interface FileMeta {
+  summary: string;
+  tags: string[];
+  related: string[];
+  load: "always" | "selective" | "never" | "keyword";
+  keywords: string[];
+}
+
 function validateName(name: string): void {
   if (name.includes("/") || name.includes("\\") || name.includes("..")) {
     throw new McpError(
@@ -27,11 +35,53 @@ function validateName(name: string): void {
   }
 }
 
-async function readMdFile(name: string): Promise<string> {
+function parseFrontmatter(content: string): { meta: FileMeta; body: string } {
+  const meta: FileMeta = {
+    summary: "",
+    tags: [],
+    related: [],
+    load: "selective",
+    keywords: [],
+  };
+  const match = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (!match) return { meta, body: content };
+
+  for (const line of match[1].split("\n")) {
+    const kv = line.match(/^(\w+):\s*(.+)$/);
+    if (!kv) continue;
+    const [, key, raw] = kv;
+    const value = raw.trim();
+
+    if (key === "summary") {
+      meta.summary = value.replace(/^["']|["']$/g, "");
+    } else if (key === "load") {
+      meta.load = value as FileMeta["load"];
+    } else if (key === "tags" || key === "related" || key === "keywords") {
+      meta[key] = value
+        .replace(/^\[|\]$/g, "")
+        .split(",")
+        .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+        .filter(Boolean);
+    }
+  }
+
+  return { meta, body: match[2] };
+}
+
+async function listMdFiles(): Promise<string[]> {
+  const entries = await fs.readdir(CONTEXT_DIR);
+  return entries.filter((f: string) => f.endsWith(".md")).sort();
+}
+
+async function readFileWithMeta(
+  name: string
+): Promise<{ meta: FileMeta; body: string; filename: string }> {
   const filename = name.endsWith(".md") ? name : `${name}.md`;
   const filePath = path.join(CONTEXT_DIR, filename);
   try {
-    return await fs.readFile(filePath, "utf-8");
+    const raw = await fs.readFile(filePath, "utf-8");
+    const { meta, body } = parseFrontmatter(raw);
+    return { meta, body, filename };
   } catch {
     throw new McpError(
       ErrorCode.InvalidParams,
@@ -40,29 +90,89 @@ async function readMdFile(name: string): Promise<string> {
   }
 }
 
-async function listMdFiles(): Promise<string[]> {
-  const entries = await fs.readdir(CONTEXT_DIR);
-  return entries.filter((f) => f.endsWith(".md")).sort();
+async function buildGraphManifest(): Promise<string> {
+  const files = await listMdFiles();
+  const parsed = await Promise.all(
+    files.map(async (file) => {
+      const raw = await fs.readFile(path.join(CONTEXT_DIR, file), "utf-8");
+      return { file, ...parseFrontmatter(raw) };
+    })
+  );
+
+  const lines = parsed
+    .filter(({ meta }) => meta.load !== "never")
+    .map(({ file, meta }) => {
+      const name = file.replace(".md", "");
+      const tags = meta.tags.join(",") || "—";
+      const related = meta.related.length ? ` →${meta.related.join(",")}` : "";
+      const loadMarker =
+        meta.load === "always"
+          ? "[always]"
+          : meta.load === "keyword"
+          ? `[keyword:${meta.keywords.join(",")}]`
+          : "";
+      const summary = meta.summary || "(no summary)";
+      return `${name}${loadMarker} | ${tags}${related} | ${summary}`;
+    });
+
+  return lines.join("\n");
 }
 
 const server = new Server(
-  { name: "personal-context", version: "1.0.0" },
+  { name: "personal-context", version: "2.0.0" },
   { capabilities: { resources: {}, tools: {} } }
 );
 
-// Tools
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "get_index",
       description:
-        "Call this first in every conversation. Returns the routing index and preferences.md (always-loaded behavior rules) in a single call.",
+        "Call first in every new conversation. Returns the compact context graph manifest — all nodes with tags, edges (→related), and one-liner summaries — plus always-loaded preferences. Use this to orient before loading any file.",
       inputSchema: { type: "object", properties: {}, required: [] },
+    },
+    {
+      name: "query_context",
+      description:
+        "Retrieve context by keyword matching against file tags and summaries. Returns full content of all matching files in one call. Prefer this over get_context_file when you know the topic but not the exact file name.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          keywords: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              'Topic keywords matched against tags and summaries (e.g. ["linkedin", "writing"] or ["career", "reply"])',
+          },
+        },
+        required: ["keywords"],
+      },
+    },
+    {
+      name: "get_context_graph",
+      description:
+        "Graph traversal: returns full content of seed nodes + one-liner summaries of their direct neighbors (depth=1 by default). Use when you want a file plus awareness of adjacent nodes without loading everything.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          seeds: {
+            type: "array",
+            items: { type: "string" },
+            description: "File names (without .md) to use as traversal seeds",
+          },
+          depth: {
+            type: "number",
+            description:
+              "0 = seeds only, 1 = seeds + neighbor summaries (default: 1)",
+          },
+        },
+        required: ["seeds"],
+      },
     },
     {
       name: "get_context_file",
       description:
-        "Load a single context file by name. Use get_context_files instead when loading 2 or more files.",
+        "Load a single context file by exact name. Use query_context when you know the topic but not the file name.",
       inputSchema: {
         type: "object",
         properties: {
@@ -77,7 +187,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_context_files",
       description:
-        "Load multiple context files in one call. Preferred over get_context_file when loading 2 or more files.",
+        "Load multiple context files in one call. Preferred over get_context_file when loading 2+ files by exact name.",
       inputSchema: {
         type: "object",
         properties: {
@@ -99,7 +209,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "update_context_file",
       description:
-        "Overwrite a context file with new content. Use to update preferences, project status, or any personal context that has changed during the conversation.",
+        "Overwrite a context file body. Existing frontmatter is preserved automatically — pass body content only. To update frontmatter, include the full ---...--- block at the top of content.",
       inputSchema: {
         type: "object",
         properties: {
@@ -109,7 +219,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           content: {
             type: "string",
-            description: "New file content",
+            description:
+              "New file content. Pass body only — frontmatter is auto-preserved.",
           },
         },
         required: ["name", "content"],
@@ -118,7 +229,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "append_to_context_file",
       description:
-        "Append content to a context file without overwriting it. Use to add new entries without losing existing data.",
+        "Append content to a context file without overwriting it. Use for append-only files (log, business-ideas entries).",
       inputSchema: {
         type: "object",
         properties: {
@@ -143,44 +254,157 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "get_index": {
-        const [indexContent, prefsContent] = await Promise.all([
-          readMdFile("index"),
-          readMdFile("preferences"),
+        const [manifest, prefsFile] = await Promise.all([
+          buildGraphManifest(),
+          readFileWithMeta("preferences"),
         ]);
+        const text = [
+          "## CONTEXT GRAPH",
+          "Format: name[load] | tags →related | summary",
+          "",
+          manifest,
+          "",
+          "---",
+          "",
+          "## PREFERENCES",
+          prefsFile.body,
+        ].join("\n");
+        return { content: [{ type: "text", text }] };
+      }
+
+      case "query_context": {
+        const { keywords } = args as { keywords: string[] };
+        const files = await listMdFiles();
+        const parsed = await Promise.all(
+          files.map(async (file) => {
+            const raw = await fs.readFile(
+              path.join(CONTEXT_DIR, file),
+              "utf-8"
+            );
+            return { file, ...parseFrontmatter(raw) };
+          })
+        );
+
+        const scored = parsed
+          .filter(({ meta }) => meta.load !== "never")
+          .map(({ file, meta, body }) => {
+            const searchable = [
+              ...meta.tags,
+              ...meta.keywords,
+              meta.summary,
+              file.replace(".md", ""),
+            ]
+              .join(" ")
+              .toLowerCase();
+            const score = keywords.filter((k) =>
+              searchable.includes(k.toLowerCase())
+            ).length;
+            return { file, body, score };
+          })
+          .filter(({ score }) => score > 0)
+          .sort((a, b) => b.score - a.score);
+
+        if (scored.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "No matching context files found for the given keywords.",
+              },
+            ],
+          };
+        }
+
+        const parts = scored.map(({ file, body }) => `## ${file}\n\n${body}`);
         return {
-          content: [{ type: "text", text: `${indexContent}\n\n---\n\n${prefsContent}` }],
+          content: [{ type: "text", text: parts.join("\n\n---\n\n") }],
         };
       }
 
-      case "get_context_files": {
-        const { names } = args as { names: string[] };
+      case "get_context_graph": {
+        const { seeds, depth = 1 } = args as {
+          seeds: string[];
+          depth?: number;
+        };
         const parts: string[] = [];
-        for (const n of names) {
-          validateName(n);
-          const content = await readMdFile(n);
-          parts.push(`## ${n}.md\n\n${content}`);
+        const neighborSummaries: string[] = [];
+        const loaded = new Set<string>(seeds);
+
+        const seedData = await Promise.all(
+          seeds.map(async (seed) => {
+            validateName(seed);
+            return { seed, ...(await readFileWithMeta(seed)) };
+          })
+        );
+
+        for (const { seed, meta, body } of seedData) {
+          parts.push(`## ${seed}.md\n\n${body}`);
+
+          if (depth >= 1) {
+            const neighbors = meta.related.filter((r) => !loaded.has(r));
+            const neighborData = await Promise.all(
+              neighbors.map(async (rel) => {
+                try {
+                  const { meta: relMeta } = await readFileWithMeta(rel);
+                  return `${rel} | ${relMeta.tags.join(",")} | ${relMeta.summary}`;
+                } catch {
+                  return null;
+                }
+              })
+            );
+            neighborSummaries.push(
+              ...neighborData.filter((n): n is string => n !== null)
+            );
+          }
         }
-        return { content: [{ type: "text", text: parts.join("\n\n---\n\n") }] };
+
+        if (neighborSummaries.length > 0) {
+          parts.push(
+            `## Adjacent nodes (summaries only — load with get_context_file if needed)\n${neighborSummaries.join("\n")}`
+          );
+        }
+
+        return {
+          content: [{ type: "text", text: parts.join("\n\n---\n\n") }],
+        };
       }
 
       case "get_context_file": {
         const { name: fileName } = args as { name: string };
         validateName(fileName);
-        const content = await readMdFile(fileName);
-        return { content: [{ type: "text", text: content }] };
+        const { body } = await readFileWithMeta(fileName);
+        return { content: [{ type: "text", text: body }] };
+      }
+
+      case "get_context_files": {
+        const { names } = args as { names: string[] };
+        const results = await Promise.all(
+          names.map(async (n) => {
+            validateName(n);
+            const { body } = await readFileWithMeta(n);
+            return `## ${n}.md\n\n${body}`;
+          })
+        );
+        return {
+          content: [{ type: "text", text: results.join("\n\n---\n\n") }],
+        };
       }
 
       case "get_all_context": {
         const files = await listMdFiles();
-        const parts: string[] = [];
-        for (const file of files) {
-          const content = await fs.readFile(
-            path.join(CONTEXT_DIR, file),
-            "utf-8"
-          );
-          parts.push(`## ${file}\n\n${content}`);
-        }
-        return { content: [{ type: "text", text: parts.join("\n\n---\n\n") }] };
+        const results = await Promise.all(
+          files.map(async (file) => {
+            const raw = await fs.readFile(
+              path.join(CONTEXT_DIR, file),
+              "utf-8"
+            );
+            const { body } = parseFrontmatter(raw);
+            return `## ${file}\n\n${body}`;
+          })
+        );
+        return {
+          content: [{ type: "text", text: results.join("\n\n---\n\n") }],
+        };
       }
 
       case "update_context_file": {
@@ -193,12 +417,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           CONTEXT_DIR,
           fileName.endsWith(".md") ? fileName : `${fileName}.md`
         );
-        await fs.writeFile(filePath, content, "utf-8");
+
+        // Preserve existing frontmatter if the incoming content has none
+        let newContent = content;
+        if (!content.startsWith("---\n")) {
+          try {
+            const existing = await fs.readFile(filePath, "utf-8");
+            const fmMatch = existing.match(/^(---\n[\s\S]*?\n---\n)/);
+            if (fmMatch) newContent = fmMatch[1] + content;
+          } catch {
+            // new file, no frontmatter to preserve
+          }
+        }
+
+        await fs.writeFile(filePath, newContent, "utf-8");
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({ success: true, file: path.basename(filePath) }),
+              text: JSON.stringify({
+                success: true,
+                file: path.basename(filePath),
+              }),
             },
           ],
         };
@@ -219,7 +459,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: JSON.stringify({ success: true, file: path.basename(filePath) }),
+              text: JSON.stringify({
+                success: true,
+                file: path.basename(filePath),
+              }),
             },
           ],
         };
@@ -237,7 +480,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// Resources
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
   const files = await listMdFiles();
   return {
@@ -267,18 +509,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   validateName(fileName.replace(/\.md$/, ""));
   const filePath = path.join(CONTEXT_DIR, fileName);
   try {
-    const content = await fs.readFile(filePath, "utf-8");
-    return {
-      contents: [{ uri, mimeType: "text/markdown", text: content }],
-    };
+    const raw = await fs.readFile(filePath, "utf-8");
+    const { body } = parseFrontmatter(raw);
+    return { contents: [{ uri, mimeType: "text/markdown", text: body }] };
   } catch {
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `Resource not found: ${uri}`
-    );
+    throw new McpError(ErrorCode.InvalidParams, `Resource not found: ${uri}`);
   }
 });
 
-// Start
 const transport = new StdioServerTransport();
 await server.connect(transport);
