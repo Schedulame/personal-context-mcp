@@ -56,13 +56,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_index",
       description:
-        "Always call this first to understand what context files are available and what each contains.",
+        "Call this first in every conversation. Returns the routing index and preferences.md (always-loaded behavior rules) in a single call.",
       inputSchema: { type: "object", properties: {}, required: [] },
     },
     {
       name: "get_context_file",
       description:
-        "Load a specific context file by name. Call get_index first to know which files are relevant.",
+        "Load a single context file by name. Use get_context_files instead when loading 2 or more files.",
       inputSchema: {
         type: "object",
         properties: {
@@ -72,6 +72,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ["name"],
+      },
+    },
+    {
+      name: "get_context_files",
+      description:
+        "Load multiple context files in one call. Preferred over get_context_file when loading 2 or more files.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          names: {
+            type: "array",
+            items: { type: "string" },
+            description: "Filenames without the .md extension",
+          },
+        },
+        required: ["names"],
       },
     },
     {
@@ -127,8 +143,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "get_index": {
-        const content = await readMdFile("index");
-        return { content: [{ type: "text", text: content }] };
+        const [indexContent, prefsContent] = await Promise.all([
+          readMdFile("index"),
+          readMdFile("preferences"),
+        ]);
+        return {
+          content: [{ type: "text", text: `${indexContent}\n\n---\n\n${prefsContent}` }],
+        };
+      }
+
+      case "get_context_files": {
+        const { names } = args as { names: string[] };
+        const parts: string[] = [];
+        for (const n of names) {
+          validateName(n);
+          const content = await readMdFile(n);
+          parts.push(`## ${n}.md\n\n${content}`);
+        }
+        return { content: [{ type: "text", text: parts.join("\n\n---\n\n") }] };
       }
 
       case "get_context_file": {
