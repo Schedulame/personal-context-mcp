@@ -27,7 +27,7 @@ interface FileMeta {
 }
 
 function validateName(name: string): void {
-  if (name.includes("/") || name.includes("\\") || name.includes("..")) {
+  if (name.includes("..") || name.includes("\\")) {
     throw new McpError(
       ErrorCode.InvalidParams,
       `Invalid file name: "${name}". Path traversal is not allowed.`
@@ -68,24 +68,51 @@ function parseFrontmatter(content: string): { meta: FileMeta; body: string } {
   return { meta, body: match[2] };
 }
 
+// Recursively list all .md files under CONTEXT_DIR.
+// Skips hidden dirs (.) and private dirs (_).
 async function listMdFiles(): Promise<string[]> {
-  const entries = await fs.readdir(CONTEXT_DIR);
-  return entries.filter((f: string) => f.endsWith(".md")).sort();
+  async function walk(dir: string, rel: string): Promise<string[]> {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const results: string[] = [];
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name.startsWith(".") || entry.name.startsWith("_")) continue;
+      const entryRel = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        results.push(...(await walk(path.join(dir, entry.name), entryRel)));
+      } else if (entry.name.endsWith(".md")) {
+        results.push(entryRel);
+      }
+    }
+    return results;
+  }
+  return walk(CONTEXT_DIR, "");
+}
+
+// Resolve a name (bare or relative path) to an absolute file path.
+// Bare names (no "/") are matched by basename across all files.
+async function resolvePath(name: string): Promise<string> {
+  const filename = name.endsWith(".md") ? name : `${name}.md`;
+  if (!filename.includes("/")) {
+    const allFiles = await listMdFiles();
+    const match = allFiles.find((f) => path.basename(f) === filename);
+    if (match) return path.join(CONTEXT_DIR, match);
+  }
+  return path.join(CONTEXT_DIR, filename);
 }
 
 async function readFileWithMeta(
   name: string
 ): Promise<{ meta: FileMeta; body: string; filename: string }> {
-  const filename = name.endsWith(".md") ? name : `${name}.md`;
-  const filePath = path.join(CONTEXT_DIR, filename);
+  const filePath = await resolvePath(name);
   try {
     const raw = await fs.readFile(filePath, "utf-8");
     const { meta, body } = parseFrontmatter(raw);
+    const filename = path.relative(CONTEXT_DIR, filePath);
     return { meta, body, filename };
   } catch {
     throw new McpError(
       ErrorCode.InvalidParams,
-      `File not found: "${filename}". Use get_index to see available files.`
+      `File not found: "${name}". Use get_index to see available files.`
     );
   }
 }
@@ -292,7 +319,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               ...meta.tags,
               ...meta.keywords,
               meta.summary,
-              file.replace(".md", ""),
+              path.basename(file).replace(".md", ""),
             ]
               .join(" ")
               .toLowerCase();
@@ -413,12 +440,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: string;
         };
         validateName(fileName);
-        const filePath = path.join(
-          CONTEXT_DIR,
-          fileName.endsWith(".md") ? fileName : `${fileName}.md`
-        );
+        const filePath = await resolvePath(fileName);
 
-        // Preserve existing frontmatter if the incoming content has none
         let newContent = content;
         if (!content.startsWith("---\n")) {
           try {
@@ -437,7 +460,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               type: "text",
               text: JSON.stringify({
                 success: true,
-                file: path.basename(filePath),
+                file: path.relative(CONTEXT_DIR, filePath),
               }),
             },
           ],
@@ -450,10 +473,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: string;
         };
         validateName(fileName);
-        const filePath = path.join(
-          CONTEXT_DIR,
-          fileName.endsWith(".md") ? fileName : `${fileName}.md`
-        );
+        const filePath = await resolvePath(fileName);
         await fs.appendFile(filePath, `\n${content}`, "utf-8");
         return {
           content: [
@@ -461,7 +481,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               type: "text",
               text: JSON.stringify({
                 success: true,
-                file: path.basename(filePath),
+                file: path.relative(CONTEXT_DIR, filePath),
               }),
             },
           ],
